@@ -920,8 +920,6 @@ class _Parser:
                 parsed = self.parse(values)
             except KeyError:
                 return None
-            if parsed is None:
-                return None
             if isinstance(parsed, helpers.ObjectId):
                 return parsed
             if isinstance(parsed, str):
