@@ -4816,6 +4816,28 @@ class MongoClientAggregateTest(_CollectionComparisonTest):
         pipeline = [{'$replaceRoot': {'newRoot': {'$mergeObjects': ['$a', '$b']}}}]
         self.cmp.compare_ignore_order.aggregate(pipeline)
 
+    def test__merge_objects_with_filter_input_none(self):
+        # Ensure that $filter handling of None input does not raise and that
+        # $mergeObjects can handle nested expressions that evaluate to None.
+        self.cmp.do.delete_many({})
+        self.cmp.do.insert_many([
+            {'_id': ObjectId(), 'a': {'a': 2}, 'b': None},
+        ])
+        pipeline = [
+            {
+                '$replaceRoot': {
+                    'newRoot': {
+                        '$mergeObjects': [
+                            '$a',
+                            {'$arrayToObject': {'$filter': {'input': '$b', 'as': 'x', 'cond': True}}},
+                        ]
+                    }
+                }
+            }
+        ]
+        # Should not raise and should result in original 'a' document as root
+        self.cmp.compare_ignore_order.aggregate(pipeline)
+
 
 @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
 class MongoClientGraphLookupTest(_CollectionComparisonTest):

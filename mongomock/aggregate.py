@@ -787,7 +787,16 @@ class _Parser:
             if missing_params:
                 raise OperationFailure(f"Missing '{missing_params.pop()}' parameter to $filter")
 
-            input_array = self.parse(value['input'])
+            input_array = self._parse_or_nothing(value['input'])
+            # If the input evaluates to a missing value or None, treat it as an empty
+            # array so that $filter returns an empty list instead of raising.
+            if input_array is None or input_array is NOTHING:
+                return []
+            if not isinstance(input_array, (list, tuple)):
+                raise OperationFailure(
+                    'The argument to $filter must be an array, but was of type: %s'
+                    % ('missing' if input_array is NOTHING else type(input_array))
+                )
             fieldname = value.get('as', 'this')
             cond = value['cond']
             return [
