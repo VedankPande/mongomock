@@ -13,7 +13,7 @@ authors = [
     { name = "Martin Domke", email = "mail@martindomke.net" },
     { name = "Pascal Corpet", email = "pascal@corpet.net" },
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.8"
 classifiers = [
     "License :: OSI Approved :: ISC License (ISCL)",
     "Topic :: Database",
@@ -25,6 +25,7 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -52,7 +53,7 @@ source = "vcs"
 packages = ["mongomock"]
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py38"
 line-length = 100
 
 [tool.ruff.format]
