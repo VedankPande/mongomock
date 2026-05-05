@@ -414,8 +414,17 @@ class _Parser:
         for value in parsed_values:
             if value is None:
                 return None
-            assert isinstance(value, numbers.Number), f'{operator} only uses numbers'
+            if operator != '$add' or not isinstance(value, datetime.datetime):
+                assert isinstance(value, numbers.Number), f'{operator} only uses numbers'
         if operator == '$add':
+            # Allow mixing datetime with numeric (millisecond offset)
+            dates = [v for v in parsed_values if isinstance(v, datetime.datetime)]
+            if dates:
+                if len(dates) > 1:
+                    raise OperationFailure('only one date allowed in an $add expression')
+                date_val = dates[0]
+                ms_total = sum(v for v in parsed_values if not isinstance(v, datetime.datetime))
+                return date_val + datetime.timedelta(milliseconds=ms_total)
             return sum(parsed_values)
         if operator == '$multiply':
             return functools.reduce(lambda x, y: x * y, parsed_values)
@@ -1744,6 +1753,25 @@ def _handle_out_stage(in_collection, database, options, unused_user_vars):
     return in_collection
 
 
+def _handle_unset_stage(in_collection, unused_database, options, unused_user_vars):
+    fields = [options] if isinstance(options, str) else list(options)
+    result = []
+    for doc in in_collection:
+        doc = dict(doc)
+        for field in fields:
+            parts = field.split('.')
+            target = doc
+            for part in parts[:-1]:
+                if not isinstance(target, dict) or part not in target:
+                    target = None
+                    break
+                target = target[part]
+            if isinstance(target, dict):
+                target.pop(parts[-1], None)
+        result.append(doc)
+    return result
+
+
 def _handle_count_stage(in_collection, database, options, unused_user_vars):
     if not isinstance(options, str) or options == '':
         raise OperationFailure('the count field must be a non-empty string')
@@ -1803,7 +1831,7 @@ _PIPELINE_HANDLERS = {
     '$skip': lambda c, d, o, v: c[o:],
     '$sort': _handle_sort_stage,
     '$sortByCount': None,
-    '$unset': None,
+    '$unset': _handle_unset_stage,
     '$unwind': _handle_unwind_stage,
 }
 
