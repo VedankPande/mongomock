@@ -415,8 +415,17 @@ class _Parser:
         for value in parsed_values:
             if value is None:
                 return None
-            assert isinstance(value, numbers.Number), f'{operator} only uses numbers'
+            if operator != '$add' or not isinstance(value, datetime.datetime):
+                assert isinstance(value, numbers.Number), f'{operator} only uses numbers'
         if operator == '$add':
+            # Allow mixing datetime with numeric (millisecond offset)
+            dates = [v for v in parsed_values if isinstance(v, datetime.datetime)]
+            if dates:
+                if len(dates) > 1:
+                    raise OperationFailure('only one date allowed in an $add expression')
+                date_val = dates[0]
+                ms_total = sum(v for v in parsed_values if not isinstance(v, datetime.datetime))
+                return date_val + datetime.timedelta(milliseconds=ms_total)
             return sum(parsed_values)
         if operator == '$multiply':
             return functools.reduce(lambda x, y: x * y, parsed_values)
@@ -841,6 +850,53 @@ class _Parser:
                 stop = start
                 start = 0
             return array_value[start:stop]
+
+        if operator == '$range':
+            if not isinstance(value, list) or len(value) not in (2, 3):
+                raise OperationFailure(
+                    'Expression $range takes at least 2 arguments, and at most 3'
+                )
+            start = self.parse(value[0])
+            end = self.parse(value[1])
+            step = self.parse(value[2]) if len(value) == 3 else 1
+            if not isinstance(start, int):
+                raise OperationFailure(
+                    f'$range requires a numeric starting value, found value of type: {type(start)}'
+                )
+            if not isinstance(end, int):
+                raise OperationFailure(
+                    f'$range requires a numeric ending value, found value of type: {type(end)}'
+                )
+            if not isinstance(step, int):
+                raise OperationFailure(
+                    f'$range requires a numeric step value, found value of type: {type(step)}'
+                )
+            if step == 0:
+                raise OperationFailure('$range requires a non-zero step value')
+            return list(range(start, end, step))
+
+        if operator == '$reduce':
+            if not isinstance(value, dict):
+                raise OperationFailure('$reduce only supports an object as its argument')
+            for k in ('input', 'initialValue', 'in'):
+                if k not in value:
+                    raise OperationFailure(f"Missing '{k}' parameter to $reduce")
+            input_array = self.parse(value['input'])
+            if input_array is None:
+                return None
+            if not isinstance(input_array, (list, tuple)):
+                raise OperationFailure(
+                    f'$reduce requires that \'input\' be an array, found: {type(input_array)}'
+                )
+            accumulator = self.parse(value['initialValue'])
+            in_expr = value['in']
+            for item in input_array:
+                accumulator = _Parser(
+                    self._doc_dict,
+                    dict(self._user_vars, **{'value': accumulator, 'this': item}),
+                    ignore_missing_keys=self._ignore_missing_keys,
+                ).parse(in_expr)
+            return accumulator
 
         raise NotImplementedError(
             f"Although '{operator}' is a valid array operator for the "
@@ -1667,6 +1723,55 @@ def _handle_add_fields_stage(in_collection, unused_database, options, user_vars)
     return out_collection
 
 
+def _handle_merge_stage(in_collection, database, options, unused_user_vars):
+    if isinstance(options, str):
+        into = options
+        on = '_id'
+        when_matched = 'merge'
+        when_not_matched = 'insert'
+    elif isinstance(options, dict):
+        into = options.get('into')
+        if isinstance(into, dict):
+            # {db: ..., coll: ...} form — only same-db supported in mongomock
+            into = into.get('coll', into)
+        on = options.get('on', '_id')
+        when_matched = options.get('whenMatched', 'merge')
+        when_not_matched = options.get('whenNotMatched', 'insert')
+    else:
+        raise OperationFailure('$merge requires a string or object argument')
+
+    out_collection = database.get_collection(into)
+    on_fields = [on] if isinstance(on, str) else list(on)
+
+    for doc in in_collection:
+        match_filter = {field: doc[field] for field in on_fields if field in doc}
+        existing = out_collection.find_one(match_filter) if match_filter else None
+
+        if existing:
+            if when_matched == 'merge':
+                update_doc = {k: v for k, v in doc.items() if k != '_id'}
+                out_collection.update_one(match_filter, {'$set': update_doc})
+            elif when_matched == 'replace':
+                out_collection.replace_one(match_filter, doc)
+            elif when_matched == 'keepExisting':
+                pass
+            elif when_matched == 'fail':
+                raise OperationFailure(
+                    '$merge with whenMatched: fail found a matching document'
+                )
+            # 'discard' — do nothing
+        else:
+            if when_not_matched == 'insert':
+                out_collection.insert_one(dict(doc))
+            elif when_not_matched == 'fail':
+                raise OperationFailure(
+                    '$merge with whenNotMatched: fail found no matching document'
+                )
+            # 'discard' — do nothing
+
+    return in_collection
+
+
 def _handle_out_stage(in_collection, database, options, unused_user_vars):
     # TODO(MetrodataTeam): should leave the origin collection unchanged
     out_collection = database.get_collection(options)
@@ -1675,6 +1780,25 @@ def _handle_out_stage(in_collection, database, options, unused_user_vars):
     if in_collection:
         out_collection.insert_many(in_collection)
     return in_collection
+
+
+def _handle_unset_stage(in_collection, unused_database, options, unused_user_vars):
+    fields = [options] if isinstance(options, str) else list(options)
+    result = []
+    for doc in in_collection:
+        doc = dict(doc)
+        for field in fields:
+            parts = field.split('.')
+            target = doc
+            for part in parts[:-1]:
+                if not isinstance(target, dict) or part not in target:
+                    target = None
+                    break
+                target = target[part]
+            if isinstance(target, dict):
+                target.pop(parts[-1], None)
+        result.append(doc)
+    return result
 
 
 def _handle_count_stage(in_collection, database, options, unused_user_vars):
@@ -1724,7 +1848,7 @@ _PIPELINE_HANDLERS = {
     '$listSessions': None,
     '$lookup': _handle_lookup_stage,
     '$match': _handle_match_stage,
-    '$merge': None,
+    '$merge': _handle_merge_stage,
     '$out': _handle_out_stage,
     '$planCacheStats': None,
     '$project': _handle_project_stage,
@@ -1736,7 +1860,7 @@ _PIPELINE_HANDLERS = {
     '$skip': lambda c, d, o, v: c[o:],
     '$sort': _handle_sort_stage,
     '$sortByCount': None,
-    '$unset': None,
+    '$unset': _handle_unset_stage,
     '$unwind': _handle_unwind_stage,
 }
 
