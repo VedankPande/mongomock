@@ -451,12 +451,10 @@ class BulkOperationBuilder:
         hint=None,
         sort=None,
     ):
-        if array_filters:
-            raise_not_implemented(
-                'array_filters', 'Array filters are not implemented in mongomock yet.'
-            )
         write_operation = BulkWriteOperation(self, selector, is_upsert=upsert)
-        write_operation.register_update_op(doc, multi, hint=hint, sort=sort)
+        write_operation.register_update_op(
+            doc, multi, hint=hint, sort=sort, array_filters=array_filters
+        )
 
     def add_replace(self, selector, doc, upsert, collation=None, hint=None, sort=None):
         write_operation = BulkWriteOperation(self, selector, is_upsert=upsert)
@@ -808,9 +806,9 @@ class Collection:
                 'mongomock yet',
             )
         if array_filters:
-            raise_not_implemented(
-                'array_filters', 'Array filters are not implemented in mongomock yet.'
-            )
+            if isinstance(document, list):
+                raise OperationFailure('arrayFilters may not be used with pipeline-style updates')
+            array_filters = _parse_array_filters(array_filters)
         if let:
             raise_not_implemented(
                 'let',
@@ -865,7 +863,9 @@ class Collection:
             if isinstance(document, list):
                 self._apply_update_pipeline(existing_document, document, session)
             else:
-                self._apply_update_document(existing_document, spec, document, was_insert)
+                self._apply_update_document(
+                    existing_document, spec, document, was_insert, array_filters=array_filters
+                )
 
             if was_insert:
                 upserted_id = self._insert(existing_document)
@@ -917,11 +917,25 @@ class Collection:
         existing_document.clear()
         existing_document.update(new_document)
 
-    def _apply_update_document(self, existing_document, spec, document, was_insert):  # noqa: C901
+    def _apply_update_document(  # noqa: C901
+        self, existing_document, spec, document, was_insert, array_filters=None
+    ):
         """Apply document, which is an update document, to existing_document.
 
         This method updates existing_document in-place.
         """
+
+        if array_filters:
+            for operator, fields in document.items():
+                if (
+                    operator not in _ARRAY_FILTER_SUPPORTED_OPS
+                    and isinstance(fields, dict)
+                    and any('$[' in key for key in fields)
+                ):
+                    raise NotImplementedError(
+                        f'Array filters with the {operator} operator are not yet '
+                        'implemented in mongomock'
+                    )
 
         first = True
         subdocument = None
@@ -929,7 +943,7 @@ class Collection:
             if k in _updaters:
                 updater = _updaters[k]
                 subdocument = self._update_document_fields_with_positional_awareness(
-                    existing_document, v, spec, updater, subdocument
+                    existing_document, v, spec, updater, subdocument, array_filters
                 )
 
             elif k == '$rename':
@@ -946,12 +960,12 @@ class Collection:
                 if not was_insert:
                     continue
                 subdocument = self._update_document_fields_with_positional_awareness(
-                    existing_document, v, spec, _set_updater, subdocument
+                    existing_document, v, spec, _set_updater, subdocument, array_filters
                 )
 
             elif k == '$currentDate':
                 subdocument = self._update_document_fields_with_positional_awareness(
-                    existing_document, v, spec, _current_date_updater, subdocument
+                    existing_document, v, spec, _current_date_updater, subdocument, array_filters
                 )
 
             elif k == '$addToSet':
@@ -1498,8 +1512,19 @@ class Collection:
         return subdocument
 
     def _update_document_fields_with_positional_awareness(
-        self, existing_document, v, spec, updater, subdocument
+        self, existing_document, v, spec, updater, subdocument, array_filters=None
     ):
+        # Field paths using array filters ($[] / $[identifier]) are resolved separately as
+        # they can match several array elements at once, unlike the positional `$`.
+        array_filter_fields = {key: val for key, val in v.items() if '$[' in key}
+        if array_filter_fields:
+            self._update_document_fields_array_filters(
+                existing_document, array_filter_fields, updater, array_filters or {}
+            )
+            v = {key: val for key, val in v.items() if '$[' not in key}
+            if not v:
+                return subdocument
+
         positional = any('$' in key for key in v)
 
         if positional:
@@ -1508,6 +1533,61 @@ class Collection:
             )
         self._update_document_fields(existing_document, v, updater)
         return subdocument
+
+    def _update_document_fields_array_filters(self, doc, fields, updater, array_filters):
+        """Apply an update to every array element targeted by an array-filter field path."""
+        for field_path, value in fields.items():
+            parts = field_path.split('.')
+            # Materialize all targets before mutating to avoid mutating while iterating.
+            targets = list(
+                self._resolve_array_filter_targets(doc, parts, array_filters, field_path)
+            )
+            for container, key in targets:
+                updater(container, key, value, codec_options=self.codec_options)
+
+    def _resolve_array_filter_targets(self, doc, parts, array_filters, field_path):
+        """Yield (container, final_key) pairs that an array-filter path resolves to.
+
+        `$[]` matches every element of an array; `$[identifier]` matches every element for
+        which the corresponding array filter applies. Navigation is read-only, so a missing
+        array results in a no-op rather than fabricating intermediate documents.
+        """
+        part = parts[0]
+        is_last = len(parts) == 1
+        if part.startswith('$[') and part.endswith(']'):
+            identifier = part[2:-1]
+            if identifier and identifier not in array_filters:
+                raise WriteError(
+                    f"No array filter found for identifier '{identifier}' in path '{field_path}'"
+                )
+            if not isinstance(doc, list):
+                return
+            array_filter = array_filters.get(identifier) if identifier else None
+            for index, element in enumerate(doc):
+                if identifier and not filter_applies(array_filter, {identifier: element}):
+                    continue
+                if is_last:
+                    yield doc, str(index)
+                else:
+                    yield from self._resolve_array_filter_targets(
+                        element, parts[1:], array_filters, field_path
+                    )
+            return
+
+        if is_last:
+            yield doc, part
+            return
+
+        if isinstance(doc, dict) and part in doc:
+            child = doc[part]
+        elif isinstance(doc, list):
+            try:
+                child = doc[int(part)]
+            except (ValueError, IndexError):
+                return
+        else:
+            return
+        yield from self._resolve_array_filter_targets(child, parts[1:], array_filters, field_path)
 
     def _update_document_single_field(self, doc, field_name, field_value, updater):
         field_name_parts = field_name.split('.')
@@ -1646,7 +1726,7 @@ class Collection:
         if remove:
             self.delete_one(query)
         else:
-            updated = self._update(query, update, upsert)
+            updated = self._update(query, update, upsert, array_filters=kwargs.get('array_filters'))
             if updated['upserted']:
                 query = {'_id': updated['upserted']}
 
@@ -2371,6 +2451,45 @@ class Cursor:
         if allow_disk_use is not None and not isinstance(allow_disk_use, bool):
             raise TypeError('allow_disk_use must be a bool')
         return self
+
+
+# Update operators for which mongomock implements array filters ($[] / $[identifier]).
+_ARRAY_FILTER_SUPPORTED_OPS = {'$set', '$inc'}
+
+
+def _extract_array_filter_identifier(array_filter):
+    """Return the single identifier referenced by an array filter document.
+
+    The identifier is the prefix before the first dot of every top-level field key, and
+    all keys in a single array filter must reference the same identifier.
+    """
+    identifiers = set()
+    for key in array_filter:
+        if key.startswith('$'):
+            raise NotImplementedError(
+                'Array filters using logical operators ($and/$or/$nor/$expr) are not '
+                'yet supported in mongomock'
+            )
+        identifiers.add(key.split('.', 1)[0])
+    if len(identifiers) != 1:
+        raise WriteError('Error parsing array filter: expected a single top-level field name')
+    return identifiers.pop()
+
+
+def _parse_array_filters(array_filters):
+    """Build a mapping of identifier -> array filter document.
+
+    Raises a WriteError if two array filters declare the same identifier.
+    """
+    parsed = {}
+    for array_filter in array_filters:
+        identifier = _extract_array_filter_identifier(array_filter)
+        if identifier in parsed:
+            raise WriteError(
+                f'Found multiple array filters with the same top-level field name {identifier}'
+            )
+        parsed[identifier] = array_filter
+    return parsed
 
 
 def _set_updater(doc, field_name, value, codec_options=None):
