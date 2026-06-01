@@ -1036,20 +1036,146 @@ class CollectionAPITest(TestCase):
             )
 
     def test__update_many_array_filters(self):
+        """$[identifier] updates every matching element across all matched documents."""
         self.db.collection.insert_many(
-            [{'a': 1, 'c': [2, 5, 6]}, {'a': 1, 'c': [3, 4, 5]}, {'a': 2, 'c': [12, 15]}]
+            [
+                {'_id': 1, 'c': [2, 5, 6]},
+                {'_id': 2, 'c': [3, 4, 5]},
+                {'_id': 3, 'c': [12, 15]},
+            ]
         )
+        # array_filters=None keeps regular updates working.
         self.db.collection.update_many(
-            filter={'a': 1},
+            filter={'_id': {'$in': [1, 2]}},
             update={'$set': {'a': 0}},
             array_filters=None,
         )
+        self.assertEqual(self.db.collection.count_documents({'a': 0}), 2)
+
+        result = self.db.collection.update_many(
+            filter={'_id': {'$in': [1, 2]}},
+            update={'$set': {'c.$[e]': 0}},
+            array_filters=[{'e': {'$lt': 5}}],
+        )
+        self.assertEqual(result.modified_count, 2)
+        self.assertEqual(self.db.collection.find_one({'_id': 1})['c'], [0, 5, 6])
+        self.assertEqual(self.db.collection.find_one({'_id': 2})['c'], [0, 0, 5])
+        # Documents that did not match the query are untouched.
+        self.assertEqual(self.db.collection.find_one({'_id': 3})['c'], [12, 15])
+
+    def test__update_all_positional_array_filter(self):
+        """$[] applies the update to every element of the array."""
+        self.db.collection.insert_one({'_id': 1, 'grades': [1, 2, 3]})
+        self.db.collection.update_one({'_id': 1}, {'$inc': {'grades.$[]': 10}})
+        self.assertEqual(self.db.collection.find_one()['grades'], [11, 12, 13])
+
+    def test__update_array_filters_nested_field(self):
+        """$[identifier] can target a field inside each matched array element."""
+        self.db.collection.insert_one(
+            {'_id': 1, 'grades': [{'grade': 80, 'mean': 1}, {'grade': 90, 'mean': 2}]}
+        )
+        self.db.collection.update_one(
+            {'_id': 1},
+            {'$set': {'grades.$[e].mean': 100}},
+            array_filters=[{'e.grade': {'$gte': 85}}],
+        )
+        self.assertEqual(
+            self.db.collection.find_one()['grades'],
+            [{'grade': 80, 'mean': 1}, {'grade': 90, 'mean': 100}],
+        )
+
+    def test__update_array_filters_nested_arrays(self):
+        """Several identifiers fan out across nested arrays."""
+        self.db.collection.insert_one(
+            {'_id': 1, 'a': [{'x': 1, 'b': [1, 5]}, {'x': 9, 'b': [2, 7]}]}
+        )
+        self.db.collection.update_one(
+            {'_id': 1},
+            {'$set': {'a.$[i].b.$[j]': 0}},
+            array_filters=[{'i.x': {'$gt': 5}}, {'j': {'$gt': 3}}],
+        )
+        self.assertEqual(
+            self.db.collection.find_one()['a'],
+            [{'x': 1, 'b': [1, 5]}, {'x': 9, 'b': [2, 0]}],
+        )
+
+    def test__update_array_filters_no_match(self):
+        """An array filter that matches nothing leaves the document unchanged."""
+        self.db.collection.insert_one({'_id': 1, 'grades': [1, 2, 3]})
+        result = self.db.collection.update_one(
+            {'_id': 1}, {'$set': {'grades.$[e]': 0}}, array_filters=[{'e': {'$gt': 100}}]
+        )
+        self.assertEqual(result.modified_count, 0)
+        self.assertEqual(self.db.collection.find_one()['grades'], [1, 2, 3])
+
+    def test__update_array_filters_missing_or_empty_array(self):
+        """A missing or empty target array is a no-op and creates no fields."""
+        self.db.collection.insert_one({'_id': 1, 'other': 1})
+        self.db.collection.insert_one({'_id': 2, 'grades': []})
+        self.db.collection.update_many(
+            {}, {'$set': {'grades.$[e]': 0}}, array_filters=[{'e': {'$lt': 5}}]
+        )
+        self.assertEqual(self.db.collection.find_one({'_id': 1}), {'_id': 1, 'other': 1})
+        self.assertEqual(self.db.collection.find_one({'_id': 2}), {'_id': 2, 'grades': []})
+
+    def test__update_array_filters_unsupported_operator(self):
+        """Operators other than $set/$inc raise NotImplementedError with array filters."""
+        self.db.collection.insert_one({'_id': 1, 'grades': [1, 2, 3]})
         with self.assertRaises(NotImplementedError):
-            self.db.collection.update_many(
-                filter={'a': 1},
-                update={'$set': {'c.$[e]': 0}},
-                array_filters=[{'e': {'$lt': 5}}],
+            self.db.collection.update_one(
+                {'_id': 1}, {'$push': {'grades.$[e]': 0}}, array_filters=[{'e': {'$lt': 5}}]
             )
+        with self.assertRaises(NotImplementedError):
+            self.db.collection.update_one(
+                {'_id': 1}, {'$unset': {'grades.$[e]': ''}}, array_filters=[{'e': {'$lt': 5}}]
+            )
+
+    def test__update_array_filters_missing_identifier(self):
+        """Referencing an identifier without a matching array filter raises an error."""
+        self.db.collection.insert_one({'_id': 1, 'grades': [1, 2, 3]})
+        with self.assertRaises(mongomock.WriteError):
+            self.db.collection.update_one(
+                {'_id': 1}, {'$set': {'grades.$[missing]': 0}}, array_filters=[{'e': {'$lt': 5}}]
+            )
+
+    def test__update_array_filters_duplicate_identifier(self):
+        """Two array filters declaring the same identifier raise an error."""
+        self.db.collection.insert_one({'_id': 1, 'grades': [1, 2, 3]})
+        with self.assertRaises(mongomock.WriteError):
+            self.db.collection.update_one(
+                {'_id': 1},
+                {'$set': {'grades.$[e]': 0}},
+                array_filters=[{'e': {'$lt': 5}}, {'e': {'$gt': 1}}],
+            )
+
+    def test__update_array_filters_pipeline_update(self):
+        """Array filters cannot be combined with a pipeline-style update."""
+        self.db.collection.insert_one({'_id': 1, 'grades': [1, 2, 3]})
+        with self.assertRaises(mongomock.OperationFailure):
+            self.db.collection.update_one(
+                {'_id': 1}, [{'$set': {'x': 1}}], array_filters=[{'e': {'$lt': 5}}]
+            )
+
+    def test__find_one_and_update_array_filters(self):
+        """find_one_and_update honours array filters."""
+        self.db.collection.insert_one({'_id': 1, 'grades': [1, 9, 3]})
+        self.db.collection.find_one_and_update(
+            {'_id': 1}, {'$set': {'grades.$[x]': 0}}, array_filters=[{'x': {'$gt': 5}}]
+        )
+        self.assertEqual(self.db.collection.find_one()['grades'], [1, 0, 3])
+
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
+    def test__bulk_write_array_filters(self):
+        """bulk_write update operations honour array filters."""
+        self.db.collection.insert_one({'_id': 1, 'grades': [1, 9, 3]})
+        self.db.collection.bulk_write(
+            [
+                pymongo.UpdateMany(
+                    {}, {'$inc': {'grades.$[x]': 100}}, array_filters=[{'x': {'$gt': 5}}]
+                )
+            ]
+        )
+        self.assertEqual(self.db.collection.find_one()['grades'], [1, 109, 3])
 
     def test__update_many_let(self):
         self.db.collection.insert_many([{'a': 1, 'c': 2}, {'a': 1, 'c': 3}, {'a': 2, 'c': 4}])
